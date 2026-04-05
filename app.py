@@ -1,17 +1,15 @@
 """
-app.py - COMPLETE FIXED VERSION
-Ink Detection + Classification + Laser Path Planning
+app.py - CORRECTED VERSION WITH PROPER METRICS
+Ink Detection + Classification + Laser Path Planning + Actual Ink Removal
 """
 
 import streamlit as st
 import cv2
 import numpy as np
 from PIL import Image
-import joblib
 import os
 from datetime import datetime
-import matplotlib.pyplot as plt
-from sklearn.ensemble import RandomForestClassifier
+import time
 
 # Page configuration
 st.set_page_config(
@@ -20,7 +18,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom CSS for better UI
+# Custom CSS
 st.markdown("""
 <style>
     .stApp {
@@ -37,16 +35,12 @@ st.markdown("""
     .stMarkdown, .stMarkdown p, .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
         color: #e0e0e0 !important;
     }
-    .stAlert {
-        background-color: rgba(30,30,50,0.9) !important;
-        border-radius: 10px !important;
-    }
-    .stButton button {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        color: white !important;
-        border: none;
-        border-radius: 8px;
-        padding: 0.5rem 1rem;
+    .success-message {
+        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        text-align: center;
+        color: white;
         font-weight: bold;
     }
 </style>
@@ -56,30 +50,28 @@ st.markdown("""
 # INK DETECTION FUNCTIONS
 # ============================================
 
-def detect_ink_regions(image):
+def detect_ink_regions(image, is_original=True):
     """
-    Detect ink regions with multiple threshold methods
+    Detect ink regions in the image
+    For original: dark pixels = ink
+    For processed: we need to detect remaining dark ink
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # Method 1: Otsu's threshold (automatic)
-    _, otsu_thresh = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    
-    # Method 2: Adaptive threshold
-    adaptive_thresh = cv2.adaptiveThreshold(
-        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY_INV, 15, 2
-    )
-    
-    # Combine methods for better detection
-    binary = cv2.bitwise_or(otsu_thresh, adaptive_thresh)
+    if is_original:
+        # For original image: dark pixels are ink
+        _, binary = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    else:
+        # For processed image: detect dark pixels (remaining ink)
+        # Use a threshold that ignores white (laser-removed) areas
+        _, binary = cv2.threshold(gray, 100, 255, cv2.THRESH_BINARY_INV)
     
     # Clean up
     kernel = np.ones((2, 2), np.uint8)
     binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
     binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
     
-    # Calculate ink percentage
+    # Calculate ink percentage (black pixels)
     ink_pixels = np.sum(binary == 255)
     total_pixels = binary.size
     ink_percentage = (ink_pixels / total_pixels) * 100
@@ -87,55 +79,44 @@ def detect_ink_regions(image):
     return binary, ink_percentage
 
 def extract_features(image, binary_mask):
-    """
-    Extract comprehensive features for classification
-    """
+    """Extract features for classification"""
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     
-    # 1. Edge density
     edges = cv2.Canny(gray, 50, 150)
     edge_density = np.sum(edges) / edges.size if edges.size > 0 else 0
     
-    # 2. Intensity variance (normalized)
     intensity_variance = np.var(gray) / (255 * 255)
     
-    # 3. Stroke width (for character recognition)
     contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours and len(contours) > 5:
         widths = []
         for cnt in contours:
             x, y, w, h = cv2.boundingRect(cnt)
-            if h > 5:  # Filter tiny noise
+            if h > 5:
                 widths.append(w / h if h > 0 else 0)
         stroke_width_var = np.var(widths) if widths else 0
     else:
         stroke_width_var = 0
     
-    # 4. Horizontal projection variance (text line uniformity)
     h_projection = np.sum(binary_mask, axis=1)
     h_var = np.var(h_projection) / 1000 if len(h_projection) > 0 else 0
     
-    # 5. Vertical projection variance
     v_projection = np.sum(binary_mask, axis=0)
     v_var = np.var(v_projection) / 1000 if len(v_projection) > 0 else 0
     
-    # 6. Connected components
-    num_labels, labels = cv2.connectedComponents(binary_mask)
-    component_count = (num_labels - 1) / 100  # Normalize
+    num_labels, _ = cv2.connectedComponents(binary_mask)
+    component_count = (num_labels - 1) / 100
     
-    # 7-8. Character dimensions
     if contours:
         heights = [cv2.boundingRect(c)[3] for c in contours if cv2.boundingRect(c)[3] > 5]
         widths = [cv2.boundingRect(c)[2] for c in contours if cv2.boundingRect(c)[2] > 5]
         avg_height = np.mean(heights) / 100 if heights else 0
         avg_width = np.mean(widths) / 100 if widths else 0
-        # Aspect ratio variation
         aspect_ratios = [w/h if h > 0 else 0 for w, h in zip(widths, heights)]
         ar_var = np.var(aspect_ratios) if aspect_ratios else 0
     else:
         avg_height = avg_width = ar_var = 0
     
-    # 9. Texture feature - Local Binary Pattern simplified
     lbp_variance = np.var(cv2.Laplacian(gray, cv2.CV_64F)) / 1000
     
     features = [[
@@ -145,72 +126,55 @@ def extract_features(image, binary_mask):
     
     return features, contours
 
-# ============================================
-# CLASSIFICATION FUNCTION (Built-in)
-# ============================================
-
-def train_and_classify(features):
-    """
-    Train a simple classifier on-the-fly or use heuristic rules
-    """
-    # Heuristic-based classification (no external model needed)
+def classify_text(features):
+    """Classify handwritten vs printed"""
     edge_density = features[0][0]
     intensity_var = features[0][1]
     stroke_var = features[0][2]
     h_var = features[0][3]
     ar_var = features[0][8]
     
-    # Decision rules based on typical characteristics
-    # Handwritten: higher variance in stroke width, less uniform projection
     handwritten_score = 0
-    
-    if stroke_var > 0.15:
-        handwritten_score += 30
-    if h_var > 0.5:
+    if stroke_var > 0.12:
+        handwritten_score += 35
+    if h_var > 0.4:
         handwritten_score += 25
-    if ar_var > 0.08:
+    if ar_var > 0.07:
         handwritten_score += 20
-    if intensity_var > 0.12:
-        handwritten_score += 15
-    if edge_density < 0.3:
-        handwritten_score += 10
+    if intensity_var > 0.1:
+        handwritten_score += 20
     
-    # Printed characteristics
     printed_score = 0
     if stroke_var < 0.08:
-        printed_score += 30
-    if h_var < 0.3:
+        printed_score += 35
+    if h_var < 0.25:
         printed_score += 25
     if ar_var < 0.04:
         printed_score += 20
-    if edge_density > 0.35:
-        printed_score += 15
+    if edge_density > 0.3:
+        printed_score += 20
     
     confidence = max(handwritten_score, printed_score)
     
-    if handwritten_score > printed_score and confidence > 40:
+    if handwritten_score > printed_score and confidence > 35:
         return "✍️ Handwritten", confidence
-    elif printed_score > handwritten_score and confidence > 40:
+    elif printed_score > handwritten_score and confidence > 35:
         return "🖨️ Printed", confidence
     else:
         return "🤔 Uncertain", confidence
 
 # ============================================
-# LASER PATH PLANNING
+# LASER PATH PLANNING & REMOVAL
 # ============================================
 
 def plan_laser_path(binary_mask, strategy="raster"):
-    """
-    Plan the laser scanning path over ink regions
-    Returns: list of points for laser to trace
-    """
+    """Plan laser scanning path over ink regions"""
     height, width = binary_mask.shape
     laser_points = []
     
     if strategy == "raster":
-        # Raster scan pattern (like a printer)
-        for y in range(0, height, 2):  # Step by 2 pixels for efficiency
-            if y % 4 < 2:  # Zig-zag pattern
+        for y in range(0, height, 2):
+            if y % 4 < 2:
                 for x in range(0, width, 2):
                     if binary_mask[y, x] == 255:
                         laser_points.append((x, y))
@@ -220,121 +184,174 @@ def plan_laser_path(binary_mask, strategy="raster"):
                         laser_points.append((x, y))
     
     elif strategy == "contour":
-        # Trace contours of ink regions
         contours, _ = cv2.findContours(binary_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         for contour in contours:
-            # Simplify contour
-            epsilon = 0.01 * cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, epsilon, True)
-            for point in approx:
+            for point in contour:
                 laser_points.append((int(point[0][0]), int(point[0][1])))
     
     elif strategy == "spiral":
-        # Spiral pattern from center outward
         center_x, center_y = width // 2, height // 2
         for radius in range(0, max(width, height), 5):
-            for angle in np.arange(0, 2 * np.pi, 0.1):
+            for angle in np.arange(0, 2 * np.pi, 0.2):
                 x = int(center_x + radius * np.cos(angle))
                 y = int(center_y + radius * np.sin(angle))
                 if 0 <= x < width and 0 <= y < height:
                     if binary_mask[y, x] == 255:
                         laser_points.append((x, y))
     
-    return laser_points
+    return list(set(laser_points))  # Remove duplicates
 
-def draw_laser_path_on_image(image, laser_points, binary_mask):
+def apply_laser_removal(image, binary_mask, laser_points, intensity):
     """
-    Draw the planned laser path on the image
+    Remove ink by turning dark pixels to match paper background
     """
     result = image.copy()
     
-    # Draw heatmap of laser points
-    for i, (x, y) in enumerate(laser_points):
-        if i % 5 == 0:  # Plot every 5th point for performance
-            # Color based on position in path (red = early, blue = late)
-            color_ratio = i / len(laser_points) if laser_points else 0
-            color = (int(255 * (1 - color_ratio)), 0, int(255 * color_ratio))
-            cv2.circle(result, (x, y), 2, color, -1)
+    # Estimate paper background color (mode of light pixels)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    light_pixels = gray[gray > 150]
+    if len(light_pixels) > 0:
+        paper_color = int(np.mean(light_pixels))
+    else:
+        paper_color = 255
     
-    # Draw connected path
+    removal_count = 0
+    points_to_process = int(len(laser_points) * (intensity / 100))
+    
+    # Process laser points
+    for i in range(min(points_to_process, len(laser_points))):
+        x, y = laser_points[i]
+        if 0 <= x < result.shape[1] and 0 <= y < result.shape[0]:
+            # Check if this is actually an ink pixel
+            if binary_mask[y, x] == 255:
+                # Turn to paper color
+                result[y, x] = [paper_color, paper_color, paper_color]
+                removal_count += 1
+                
+                # Spread effect for high intensity
+                if intensity > 70:
+                    for dx in [-1, 0, 1]:
+                        for dy in [-1, 0, 1]:
+                            nx, ny = x + dx, y + dy
+                            if 0 <= nx < result.shape[1] and 0 <= ny < result.shape[0]:
+                                if binary_mask[ny, nx] == 255:
+                                    result[ny, nx] = [paper_color, paper_color, paper_color]
+                                    removal_count += 1
+    
+    return result, removal_count, points_to_process
+
+def draw_laser_path_on_image(image, laser_points, processed_count=0):
+    """Draw laser path visualization"""
+    result = image.copy()
+    
+    for i, (x, y) in enumerate(laser_points):
+        if i < processed_count:
+            cv2.circle(result, (x, y), 2, (0, 255, 0), -1)  # Processed - green
+        else:
+            cv2.circle(result, (x, y), 1, (0, 0, 255), -1)  # Pending - red
+    
     if len(laser_points) > 1:
         points_array = np.array(laser_points, dtype=np.int32)
         cv2.polylines(result, [points_array], False, (0, 255, 255), 1)
     
     return result
 
-def calculate_laser_metrics(laser_points, binary_mask):
-    """
-    Calculate laser operation metrics
-    """
-    total_ink_pixels = np.sum(binary_mask == 255)
-    points_to_hit = len(set(laser_points))  # Unique points
+def calculate_ink_removal_metrics(original_ink_pixels, final_ink_pixels, original_percentage, final_percentage):
+    """Calculate accurate removal metrics"""
     
-    coverage = (points_to_hit / total_ink_pixels * 100) if total_ink_pixels > 0 else 0
+    # Absolute removal
+    pixels_removed = max(0, original_ink_pixels - final_ink_pixels)
     
-    # Estimate time (assuming 1000 points per second)
-    estimated_time = points_to_hit / 1000
+    # Percentage removal (based on original ink)
+    if original_ink_pixels > 0:
+        removal_percentage = (pixels_removed / original_ink_pixels) * 100
+    else:
+        removal_percentage = 0
+    
+    # Change in percentage points
+    percentage_points_reduced = max(0, original_percentage - final_percentage)
     
     return {
-        'total_laser_points': points_to_hit,
-        'ink_coverage_percentage': coverage,
-        'estimated_seconds': estimated_time,
-        'efficiency': min(100, coverage * 1.2)  # Efficiency metric
+        'pixels_removed': pixels_removed,
+        'removal_percentage': removal_percentage,
+        'percentage_points_reduced': percentage_points_reduced,
+        'remaining_ink_percentage': final_percentage
     }
+
+# ============================================
+# ANIMATION FUNCTION
+# ============================================
+
+def animate_laser_removal(image, laser_points, binary_mask, intensity, progress_bar, status_text):
+    """Animate laser removal process"""
+    result = image.copy()
+    
+    # Estimate paper color
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    light_pixels = gray[gray > 150]
+    paper_color = int(np.mean(light_pixels)) if len(light_pixels) > 0 else 255
+    
+    total_points = len(laser_points)
+    points_to_process = int(total_points * (intensity / 100))
+    
+    for i in range(0, points_to_process, max(1, points_to_process // 50)):
+        batch_end = min(i + (total_points // 50), points_to_process)
+        
+        for j in range(i, batch_end):
+            if j < len(laser_points):
+                x, y = laser_points[j]
+                if 0 <= x < result.shape[1] and 0 <= y < result.shape[0]:
+                    if binary_mask[y, x] == 255:
+                        result[y, x] = [paper_color, paper_color, paper_color]
+                        
+                        if intensity > 70:
+                            for dx in [-1, 0, 1]:
+                                for dy in [-1, 0, 1]:
+                                    nx, ny = x + dx, y + dy
+                                    if 0 <= nx < result.shape[1] and 0 <= ny < result.shape[0]:
+                                        if binary_mask[ny, nx] == 255:
+                                            result[ny, nx] = [paper_color, paper_color, paper_color]
+        
+        progress = (batch_end / total_points) * 100
+        progress_bar.progress(min(100, progress / 100))
+        status_text.text(f"🔥 Laser processing... {progress:.1f}% complete")
+        
+        yield result.copy()
+        time.sleep(0.03)
+    
+    status_text.text("✅ Laser deprinting complete!")
+    yield result
 
 # ============================================
 # MAIN APPLICATION
 # ============================================
 
 def main():
-    # Header
     st.markdown("""
     <div class="main-header">
-        <h1>🖋️ Ink Detection & Laser Deprinting System</h1>
-        <p>Complete Document Analysis | Handwritten vs Printed | Laser Path Planning</p>
+        <h1>🖋️ Laser Deprinting System</h1>
+        <p>Ink Detection | Classification | Laser Path Planning | Actual Ink Removal</p>
     </div>
     """, unsafe_allow_html=True)
     
-    # Sidebar - OPTIONAL, can be hidden
-    show_sidebar = st.checkbox("Show Controls Panel", value=True)
-    
-    if show_sidebar:
-        with st.sidebar:
-            st.markdown("## 🎮 Controls")
-            
-            input_method = st.radio("Input Method", ["📁 Upload Image", "📸 Capture from Camera"])
-            
-            st.markdown("---")
-            st.markdown("## ⚙️ Laser Settings")
-            
-            laser_intensity = st.slider("Laser Power (%)", 0, 100, 70)
-            laser_strategy = st.selectbox("Laser Scanning Pattern", ["raster", "contour", "spiral"])
-            
-            st.markdown("---")
-            st.markdown("## 📈 Display Options")
-            show_laser_path = st.checkbox("Show Laser Path Planning", value=True)
-            show_comparison = st.checkbox("Show Before/After", value=True)
-            
-            st.markdown("---")
-            st.markdown("### ℹ️ System Info")
-            st.info("""
-            **Laser Strategies:**
-            - **Raster:** Grid pattern (like printer)
-            - **Contour:** Follows ink edges  
-            - **Spiral:** Center-out pattern
-            """)
-    else:
-        # Default values when sidebar hidden
-        input_method = "📁 Upload Image"
-        laser_intensity = 70
-        laser_strategy = "raster"
-        show_laser_path = True
-        show_comparison = True
-    
-    # Main content
-    image = None
+    # Sidebar
+    with st.sidebar:
+        st.markdown("## 🎮 Controls")
+        input_method = st.radio("Input Method", ["📁 Upload Image", "📸 Capture from Camera"])
+        
+        st.markdown("---")
+        st.markdown("## ⚙️ Laser Settings")
+        laser_intensity = st.slider("Laser Power (%)", 0, 100, 80)
+        laser_strategy = st.selectbox("Scanning Pattern", ["raster", "contour", "spiral"])
+        
+        st.markdown("---")
+        st.markdown("## 🎬 Display")
+        animate_mode = st.checkbox("Animate Laser Process", value=True)
+        show_path = st.checkbox("Show Laser Path", value=True)
     
     # Image input
+    image = None
+    
     if input_method == "📁 Upload Image":
         uploaded_file = st.file_uploader("Choose an image...", type=["jpg", "jpeg", "png", "bmp"])
         if uploaded_file:
@@ -355,174 +372,176 @@ def main():
         elif len(image.shape) == 3 and image.shape[-1] == 3:
             image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
         
-        with st.spinner("🔍 Analyzing document..."):
-            # Detect ink
-            binary_mask, ink_percentage = detect_ink_regions(image)
-            
-            # Extract features and classify
-            features, contours = extract_features(image, binary_mask)
-            text_type, confidence = train_and_classify(features)
-            
-            # Plan laser path
-            laser_points = plan_laser_path(binary_mask, laser_strategy)
-            laser_path_image = draw_laser_path_on_image(image, laser_points, binary_mask)
-            
-            # Simulate laser removal
-            removal_factor = laser_intensity / 100
-            laser_result = image.copy()
-            ink_regions = binary_mask > 0
-            for c in range(3):
-                channel = laser_result[:, :, c]
-                channel[ink_regions] = channel[ink_regions] * (1 - removal_factor * 0.9)
-                laser_result[:, :, c] = np.clip(channel, 0, 255)
-            
-            # Calculate metrics
-            laser_metrics = calculate_laser_metrics(laser_points, binary_mask)
+        # STEP 1: Detect Ink on ORIGINAL image
+        with st.spinner("🔍 Detecting ink regions..."):
+            original_binary, original_ink_percentage = detect_ink_regions(image, is_original=True)
+            features, contours = extract_features(image, original_binary)
+            text_type, confidence = classify_text(features)
         
-        # Display results
+        # Display original analysis
         col1, col2 = st.columns(2)
         
         with col1:
             st.markdown("### 📷 Original Image")
             st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), use_column_width=True)
+            
+            st.markdown("### 📊 Original Analysis")
+            st.metric("Initial Ink Coverage", f"{original_ink_percentage:.2f}%")
+            st.metric("Text Type", text_type)
+            st.metric("Confidence", f"{confidence:.0f}%")
         
         with col2:
-            if show_comparison:
-                st.markdown("### 💥 After Laser Removal")
-                st.image(cv2.cvtColor(laser_result, cv2.COLOR_BGR2RGB), use_column_width=True)
-            else:
-                st.markdown("### 🎯 Detected Ink")
-                st.image(binary_mask, use_column_width=True)
+            st.markdown("### 🎯 Detected Ink Regions")
+            st.image(original_binary, use_column_width=True)
+            ink_pixels = np.sum(original_binary == 255)
+            st.metric("Ink Pixels Detected", f"{ink_pixels:,}")
+            st.metric("Contours Found", len(contours))
         
-        # Laser Path Visualization
-        if show_laser_path:
-            st.markdown("---")
-            st.markdown("### 🔴 Laser Path Planning")
-            st.image(cv2.cvtColor(laser_path_image, cv2.COLOR_BGR2RGB), use_column_width=True)
-            
-            # Laser metrics
-            col1, col2, col3, col4 = st.columns(4)
-            with col1:
-                st.metric("Laser Points", f"{laser_metrics['total_laser_points']:,}")
-            with col2:
-                st.metric("Ink Coverage", f"{laser_metrics['ink_coverage_percentage']:.1f}%")
-            with col3:
-                st.metric("Est. Time", f"{laser_metrics['estimated_seconds']:.1f}s")
-            with col4:
-                st.metric("Efficiency", f"{laser_metrics['efficiency']:.0f}%")
-        
-        # Classification Result
+        # STEP 2: Plan Laser Path
         st.markdown("---")
-        st.markdown("### 🧠 Classification Result")
+        st.markdown("## 🔴 Laser Path Planning")
         
-        if text_type == "✍️ Handwritten":
-            st.success(f"## {text_type}")
-            st.info(f"**Confidence:** {confidence:.0f}% | Detected irregular stroke widths and varying character alignment")
-        elif text_type == "🖨️ Printed":
-            st.info(f"## {text_type}")
-            st.success(f"**Confidence:** {confidence:.0f}% | Detected uniform stroke widths and consistent text alignment")
-        else:
-            st.warning(f"## {text_type}")
-            st.info("Try an image with clearer text for better classification")
-        
-        # Ink Analysis
-        st.markdown("---")
-        st.markdown("### 📊 Ink Analysis")
+        laser_points = plan_laser_path(original_binary, laser_strategy)
         
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("Ink Coverage", f"{ink_percentage:.2f}%")
-            status = "✅ Ink Detected" if ink_percentage > 1 else "❌ No Ink"
-            st.write(f"**Status:** {status}")
+            st.metric("Laser Points Planned", f"{len(laser_points):,}")
         with col2:
-            st.metric("Contours Found", len(contours))
+            coverage = (len(laser_points) / max(1, ink_pixels)) * 100
+            st.metric("Path Coverage", f"{coverage:.1f}%")
         with col3:
-            removal_estimate = min(95, laser_intensity * 0.85)
-            st.metric("Est. Removal", f"{removal_estimate:.0f}%")
+            est_time = len(laser_points) / 500
+            st.metric("Est. Time", f"{est_time:.1f}s")
         
-        # Technical Explanation
-        with st.expander("🔬 How It Works - Technical Details"):
+        if show_path:
+            path_image = draw_laser_path_on_image(image, laser_points, 0)
+            st.image(cv2.cvtColor(path_image, cv2.COLOR_BGR2RGB), use_column_width=True)
+            st.caption("🔴 Red: Target | 🟡 Line: Laser Path")
+        
+        # STEP 3: Execute Laser Removal
+        st.markdown("---")
+        st.markdown("## 💥 Execute Laser Deprinting")
+        
+        if st.button("🚀 START LASER REMOVAL", use_container_width=True):
+            if animate_mode:
+                # Animated removal
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                animation_placeholder = st.empty()
+                
+                for frame in animate_laser_removal(image, laser_points, original_binary, laser_intensity, progress_bar, status_text):
+                    animation_placeholder.image(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB), use_column_width=True)
+                
+                final_result, removed_count, processed = apply_laser_removal(image, original_binary, laser_points, laser_intensity)
+            else:
+                # Instant removal
+                with st.spinner("🔥 Laser processing..."):
+                    final_result, removed_count, processed = apply_laser_removal(image, original_binary, laser_points, laser_intensity)
+                st.image(cv2.cvtColor(final_result, cv2.COLOR_BGR2RGB), use_column_width=True)
+            
+            # STEP 4: Calculate FINAL ink metrics on processed image
+            final_binary, final_ink_percentage = detect_ink_regions(final_result, is_original=False)
+            final_ink_pixels = np.sum(final_binary == 255)
+            original_ink_pixels = np.sum(original_binary == 255)
+            
+            # Calculate accurate metrics
+            metrics = calculate_ink_removal_metrics(
+                original_ink_pixels, 
+                final_ink_pixels,
+                original_ink_percentage,
+                final_ink_percentage
+            )
+            
+            # Display success and metrics
+            st.markdown(f"""
+            <div class="success-message">
+                ✅ Laser Deprinting Complete!<br>
+                Laser Power: {laser_intensity}% | Strategy: {laser_strategy}
+            </div>
+            """, unsafe_allow_html=True)
+            
+            # Metrics dashboard
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Pixels Removed", f"{metrics['pixels_removed']:,}")
+            with col2:
+                st.metric("Removal Rate", f"{metrics['removal_percentage']:.1f}%")
+            with col3:
+                st.metric("Ink Before", f"{original_ink_percentage:.2f}%")
+            with col4:
+                st.metric("Ink After", f"{final_ink_percentage:.2f}%")
+            
+            # Progress visualization
+            st.markdown("### 📈 Removal Progress")
+            progress_bar2 = st.progress(metrics['removal_percentage'] / 100)
+            st.caption(f"🎯 {metrics['removal_percentage']:.1f}% of ink removed")
+            
+            # Before/After comparison
+            st.markdown("### 📸 Before vs After")
+            compare_col1, compare_col2 = st.columns(2)
+            with compare_col1:
+                st.image(cv2.cvtColor(image, cv2.COLOR_BGR2RGB), caption="BEFORE", use_column_width=True)
+            with compare_col2:
+                st.image(cv2.cvtColor(final_result, cv2.COLOR_BGR2RGB), caption="AFTER LASER", use_column_width=True)
+            
+            # Download button
+            result_rgb = cv2.cvtColor(final_result, cv2.COLOR_BGR2RGB)
+            result_pil = Image.fromarray(result_rgb)
+            import io
+            buf = io.BytesIO()
+            result_pil.save(buf, format="PNG")
+            byte_im = buf.getvalue()
+            
+            st.download_button(
+                label="📥 Download Laser Processed Image",
+                data=byte_im,
+                file_name=f"laser_deprinted_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+                mime="image/png"
+            )
+        
+        # Technical explanation
+        with st.expander("🔬 How Laser Removal Works"):
             st.markdown("""
-            ### Ink Detection
-            - **Otsu's Thresholding**: Automatically finds optimal threshold
-            - **Adaptive Thresholding**: Handles varying lighting conditions
-            - **Morphological Operations**: Removes noise and connects broken text
+            ### The Deprinting Process:
             
-            ### Classification Features (10 features)
-            1. **Edge Density** - Printed text has more uniform edges
-            2. **Intensity Variance** - Handwriting shows more variation
-            3. **Stroke Width Variance** - Key differentiator (handwritten varies more)
-            4. **Horizontal Projection** - Printed text has more uniform line spacing
-            5. **Vertical Projection** - Character spacing uniformity
-            6. **Connected Components** - Count of separate text elements
-            7-8. **Character Dimensions** - Height and width statistics
-            9. **Aspect Ratio Variation** - Handwriting has more variation
-            10. **Texture Features** - Local pattern analysis
+            1. **Ink Detection**: Identifies all dark ink pixels
+            2. **Path Planning**: Calculates optimal laser scanning pattern
+            3. **Laser Application**: Virtual laser turns ink pixels to paper color
+            4. **Verification**: Measures remaining ink after processing
             
-            ### Laser Path Planning
-            - **Raster Scan**: Efficient for full-page coverage
-            - **Contour Tracing**: Precise edge following
-            - **Spiral Pattern**: Center-out scanning for targeted removal
+            ### Why Metrics Are Now Accurate:
+            - Original ink: Detects dark pixels (ink)
+            - After laser: Detects remaining dark pixels
+            - Removal = Original - Remaining
             
-            ### Real Laser System Parameters
-            - **Wavelength**: 532nm (green) or 1064nm (IR)
-            - **Pulse Duration**: Nanoseconds to picoseconds
-            - **Fluence**: 0.5-2.5 J/cm²
-            - **Scan Speed**: 100-1000 mm/s
+            ### Real Laser Parameters:
+            | Parameter | Value |
+            |-----------|-------|
+            | Wavelength | 532nm (green) |
+            | Pulse Duration | Nanoseconds |
+            | Spot Size | 20-50μm |
+            | Fluence | 0.5-2.5 J/cm² |
             """)
-        
-        # Download report
-        report = f"""
-# Ink Detection & Laser Deprinting Report
-
-**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
-
-## Results
-- **Text Type:** {text_type}
-- **Confidence:** {confidence:.0f}%
-- **Ink Coverage:** {ink_percentage:.2f}%
-- **Laser Strategy:** {laser_strategy}
-- **Laser Intensity:** {laser_intensity}%
-
-## Laser Metrics
-- Total Points: {laser_metrics['total_laser_points']:,}
-- Coverage: {laser_metrics['ink_coverage_percentage']:.1f}%
-- Estimated Time: {laser_metrics['estimated_seconds']:.1f}s
-- Efficiency: {laser_metrics['efficiency']:.0f}%
-
-## Analysis
-{text_type} text detected with {confidence:.0f}% confidence. 
-Laser will trace {laser_metrics['total_laser_points']:,} points 
-covering {laser_metrics['ink_coverage_percentage']:.1f}% of ink.
-"""
-        
-        st.download_button("📥 Download Report", report, f"laser_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt")
     
     else:
         st.info("👈 Upload an image or use camera to begin")
         
-        # Demo instructions
         st.markdown("""
-        ### 🎯 What This System Does:
+        ### 🎯 Laser Deprinting System
         
-        | Feature | Description |
-        |---------|-------------|
-        | 🔍 **Ink Detection** | Detects all ink regions using advanced thresholding |
-        | 🧠 **Text Classification** | Distinguishes handwritten vs printed using 10 features |
-        | 🔴 **Laser Path Planning** | Shows exactly where laser will trace to remove ink |
-        | 💥 **Laser Simulation** | Visualizes ink removal based on intensity |
+        **Complete workflow:**
+        1. **Ink Detection** - Find all ink pixels
+        2. **Classification** - Handwritten vs Printed
+        3. **Path Planning** - Optimize laser scanning
+        4. **Laser Removal** - Remove ink (turn to paper color)
+        5. **Verification** - Calculate removal metrics
         
-        ### 📝 Test With:
-        - Handwritten notes on white paper
+        **Try with:**
+        - Handwritten notes
         - Printed documents
-        - Mixed content
-        
-        ### ⚡ New Features Added:
-        - ✅ Working classification (no external model needed)
-        - ✅ Laser path tracing visualization
-        - ✅ Multiple scanning patterns (raster/contour/spiral)
-        - ✅ Sidebar can be hidden
+        - Text on white paper
         """)
 
 if __name__ == "__main__":
+    import numpy as np
     main()
